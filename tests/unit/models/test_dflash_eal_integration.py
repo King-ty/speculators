@@ -202,26 +202,54 @@ def test_default_anchor_layout_has_nonzero_block_loss_gradient(loss_name):
     assert gradient.abs().sum() > 0
 
 
-def test_forward_stops_real_trajectory_at_document_boundary(monkeypatch):
-    model = _tiny_model(False)
+@pytest.mark.parametrize("sample_from_anchor", [False, True])
+@pytest.mark.parametrize("boundary", ["document", "eos"])
+@pytest.mark.parametrize("anchor", [2, 3])
+@pytest.mark.parametrize("loss_spec", ["real", '{"real":0.9,"ce":0.1}'])
+def test_forward_masks_prediction_boundaries(
+    monkeypatch, sample_from_anchor, boundary, anchor, loss_spec
+):
+    model = _tiny_model(sample_from_anchor)
     monkeypatch.setattr(
         "speculators.models.dflash.core.select_anchors",
-        lambda *_args: (torch.tensor([0]), torch.tensor([True])),
+        lambda *_args: (torch.tensor([anchor]), torch.tensor([True])),
     )
     generator = torch.Generator().manual_seed(1)
     document_ids = torch.zeros(1, 32, dtype=torch.long)
-    document_ids[:, 1:] = 1
+    loss_mask = torch.ones(1, 32)
+    # Token 3 ends the first document or is EOS. Token 4 must never contribute.
+    if boundary == "document":
+        document_ids[:, 4:] = 1
+    else:
+        loss_mask[:, 4:] = 0
+    captured_logits = []
+    model.lm_head.register_forward_hook(
+        lambda _module, _inputs, output: captured_logits.append(output)
+    )
     _, loss, metrics = model(
         hidden_states=torch.randn(1, 32, 32, generator=generator),
         input_ids=torch.randint(0, 64, (1, 32), generator=generator),
-        loss_mask=torch.ones(1, 32),
+        loss_mask=loss_mask,
         verifier_last_hidden_states=torch.randn(1, 32, 16, generator=generator),
         document_ids=document_ids,
         max_anchors=1,
-        loss_config=resolve_loss_config("real", "eager"),
+        loss_config=resolve_loss_config(loss_spec, "eager"),
     )
-    assert loss.item() == 0.0
-    assert metrics["eal_j_b_total"].item() == 0
+    expected_valid = torch.zeros(4, dtype=torch.bool)
+    if anchor == 2:
+        expected_valid[0 if sample_from_anchor else 1] = True
+    (gradient,) = torch.autograd.grad(loss, captured_logits[0])
+    assert torch.isfinite(gradient).all()
+    assert gradient[0, ~expected_valid].abs().sum() == 0
+    assert metrics["full_acc_total"].item() == int(expected_valid.sum())
+    assert metrics["eal_j_b_total"].item() == int(expected_valid.any())
+    assert metrics["eal_total"].item() == int(expected_valid.any())
+    if expected_valid.any():
+        assert gradient[0, expected_valid].abs().sum() > 0
+    else:
+        assert loss.item() == 0.0
+        if "ce" in loss_spec:
+            assert metrics["ce_loss_sum"].item() == 0.0
 
 
 def _tiny_reduced_vocab_model():

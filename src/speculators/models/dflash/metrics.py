@@ -114,11 +114,17 @@ def _real_parameters(
     )
 
 
-def _reject_duplicate_objectives(block_names: list[str]) -> None:
+def _validate_block_objectives(
+    block_names: list[str], token_ids: torch.Tensor | None
+) -> None:
     canonical_names = [_LOSS_NAME_ALIASES.get(name, name) for name in block_names]
     if len(canonical_names) != len(set(canonical_names)):
         raise ValueError(
             f"Duplicate loss objective after resolving legacy aliases: {block_names}"
+        )
+    if block_names and token_ids is None:
+        raise ValueError(
+            f"losses {block_names} are block-structured and require token_ids"
         )
 
 
@@ -739,11 +745,7 @@ def compute_metrics(
 
     multi = len(loss_config) > 1
     block_names = [n for n in loss_config if n in _BLOCK_LOSS_NAMES]
-    _reject_duplicate_objectives(block_names)
-    if block_names and token_ids is None:
-        raise ValueError(
-            f"losses {block_names} are block-structured and require token_ids"
-        )
+    _validate_block_objectives(block_names, token_ids)
     start_pos = 0 if sample_from_anchor else 1
     prediction_length = block_size - start_pos
     path_diagnostics = bool(block_names) if eal_diagnostics is None else eal_diagnostics
@@ -751,6 +753,29 @@ def compute_metrics(
     block_loss_implementation = _block_loss_implementation(
         loss_config, block_names, needs_eal_terms, use_draft_vocab
     )
+
+    eal_terms = None
+    if needs_eal_terms:
+        eal_terms = compute_eal_terms(
+            logits,
+            targets,
+            cast("torch.Tensor", token_ids),
+            loss_mask,
+            block_size,
+            start_pos=start_pos,
+            document_ids=block_document_ids,
+            loss_implementation=block_loss_implementation,
+        )
+        if block_names:
+            # Auxiliary losses and accuracy metrics must use the same stopped
+            # trajectories as the block objective. Restore the excluded anchor
+            # as an invalid slot for consumers of the original block layout.
+            valid = eal_terms["valid"]
+            loss_mask = (
+                torch.cat([torch.zeros_like(valid[:, :start_pos]), valid], dim=-1)
+                .reshape_as(loss_mask)
+                .to(loss_mask.dtype)
+            )
 
     std_config = {
         name: fn_weight
@@ -771,18 +796,6 @@ def compute_metrics(
         sample_from_anchor,
     )
 
-    eal_terms = None
-    if needs_eal_terms:
-        eal_terms = compute_eal_terms(
-            logits,
-            targets,
-            cast("torch.Tensor", token_ids),
-            loss_mask,
-            block_size,
-            start_pos=start_pos,
-            document_ids=block_document_ids,
-            loss_implementation=block_loss_implementation,
-        )
     eal_terms_for_loss = cast("dict[str, torch.Tensor]", eal_terms)
     for name in block_names:
         _, weight = loss_config[name]

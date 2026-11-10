@@ -404,6 +404,39 @@ class TestTrajectoryLayout:
         assert gradient[0, 0].abs().sum() == 0
         assert gradient[0, 1:].abs().sum() > 0
 
+    @pytest.mark.parametrize("sample_from_anchor", [False, True])
+    @pytest.mark.parametrize("boundary", ["document", "mask_gap"])
+    def test_mixed_loss_uses_trajectory_mask(self, sample_from_anchor, boundary):
+        logits, targets, token_ids, _ = self._random_batch()
+        loss_mask = torch.ones(1, 4)
+        document_ids = torch.zeros(1, 4, dtype=torch.long)
+        if boundary == "document":
+            document_ids[:, 2:] = 1
+        else:
+            loss_mask[:, 2] = 0  # Later valid tokens must not restart the path.
+        expected_mask = torch.tensor([[int(sample_from_anchor), 1, 0, 0]])
+        kwargs: dict[str, Any] = {
+            "block_size": 4,
+            "sample_from_anchor": sample_from_anchor,
+            "token_ids": token_ids,
+            "loss_config": resolve_loss_config('{"real":0.9,"ce":0.1}'),
+        }
+        loss, metrics = compute_metrics(
+            logits, targets, loss_mask, block_document_ids=document_ids, **kwargs
+        )
+        expected_loss, expected_metrics = compute_metrics(
+            logits, targets, expected_mask, **kwargs
+        )
+        torch.testing.assert_close(loss, expected_loss)
+        torch.testing.assert_close(
+            metrics["ce_loss_sum"], expected_metrics["ce_loss_sum"]
+        )
+        assert metrics["full_acc_total"].item() == expected_mask.sum().item()
+        (gradient,) = torch.autograd.grad(loss, logits, retain_graph=True)
+        (expected_gradient,) = torch.autograd.grad(expected_loss, logits)
+        torch.testing.assert_close(gradient, expected_gradient)
+        assert gradient[~expected_mask.bool()].abs().sum() == 0
+
     def test_eager_never_dispatches_to_fused_on_cuda(self, monkeypatch):
         class CudaTensor:
             is_cuda = True

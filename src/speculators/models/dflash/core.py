@@ -497,7 +497,19 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         logits = self.lm_head(hidden)
         # shape: [1, num_anchors*block_size, vocab_size]
 
-        aligned_loss_mask = loss_mask.clone()[:, anchored_block_indices]
+        # Match masks to the token being predicted, including next-token slots
+        # when sampling from the anchor. No prediction may cross its anchor's
+        # document boundary, even when the next document has trainable tokens.
+        target_token_indices = anchored_block_indices + int(
+            self.config.sample_from_anchor
+        )
+        aligned_loss_mask = loss_mask[:, target_token_indices]
+        anchor_document_ids = document_ids[:, anchor_positions].repeat_interleave(
+            self.block_size, dim=1
+        )
+        aligned_loss_mask = aligned_loss_mask * (
+            document_ids[:, target_token_indices] == anchor_document_ids
+        ).to(aligned_loss_mask.dtype)
         # shape: [1, num_anchors*block_size]
 
         # zero out any padded anchor blocks
@@ -566,7 +578,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             token_ids=token_ids,
             block_group_ids=block_group_ids,
             block_document_ids=document_ids.squeeze(0)[
-                anchored_block_indices
+                anchored_block_indices + int(self.config.sample_from_anchor)
             ].unsqueeze(0),
             use_draft_vocab=self.use_draft_vocab,
             realv_lambda=kwargs.get(
