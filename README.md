@@ -138,9 +138,9 @@ print(speculators.__version__)
 
 ## REAL loss objectives
 
-This branch contains the independently implemented REAL acceptance-length objectives and DFlash integration, with synthetic tests. It does not include the Domino model, curriculum training, or vLLM serving adaptations.
+This branch provides a reference implementation of REAL, REAL w/o RB, REAL-V, and REAL-K, together with the WTV, DBLast, and VSD loss-level baselines. See the [loss implementation](src/speculators/models/dflash/metrics.py) and [numerical tests](tests/unit/models/test_dflash_eal.py).
 
-Included objectives are REAL w/o RB (`realp`), REAL (`real`), WTV (`wtv`), DBLast (`dblast`), VSD (`vsd`), and the stability variants `realv` and `realk`. The stability variants expose `realv_lambda`, `realk_k`, `real_guard_on`, `real_guard_mu0`, `real_guard_delta`, and `real_guard_rho` through `DFlashSpeculatorConfig` and `DFlashArgs`. K is derived from `real_guard_mu0` when provided, otherwise from the current EAL-B mean, and is clamped to `1..block_size`. The guard is disabled by default and requires an explicit reference mean when enabled.
+This release covers the loss functions only. The internal training implementation and scripts for reproducing the paper's experiments are not included.
 
 ## License
 

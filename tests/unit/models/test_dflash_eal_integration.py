@@ -9,7 +9,7 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3Config
 from speculators.losses import resolve_loss_config
 from speculators.models.dflash.config import DFlashSpeculatorConfig
 from speculators.models.dflash.core import DFlashDraftModel
-from speculators.train.config.schema import DFlashArgs
+from speculators.train.config.schema import DFlashArgs, LossArgs, TrainConfig
 
 
 def _tiny_model(sample_from_anchor: bool) -> DFlashDraftModel:
@@ -178,3 +178,111 @@ def test_real_parameters_reject_invalid_values():
         DFlashSpeculatorConfig(realk_k=True)
     with pytest.raises(ValueError, match="valid integer"):
         DFlashArgs(realk_k=True)
+
+
+@pytest.mark.parametrize("loss_name", ["wtv", "realk"])
+def test_default_anchor_layout_has_nonzero_block_loss_gradient(loss_name):
+    model = _tiny_model(False)
+    generator = torch.Generator().manual_seed(1)
+    batch = {
+        "hidden_states": torch.randn(1, 32, 32, generator=generator),
+        "input_ids": torch.randint(0, 64, (1, 32), generator=generator),
+        "loss_mask": torch.ones(1, 32),
+        "verifier_last_hidden_states": torch.randn(1, 32, 16, generator=generator),
+        "document_ids": torch.zeros(1, 32, dtype=torch.long),
+    }
+    _, loss, _ = model(
+        **batch,
+        max_anchors=8,
+        loss_config=resolve_loss_config(loss_name, "eager"),
+        realk_k=1,
+    )
+    (gradient,) = torch.autograd.grad(loss, model.fc.weight)
+    assert torch.isfinite(gradient).all()
+    assert gradient.abs().sum() > 0
+
+
+def test_forward_stops_real_trajectory_at_document_boundary(monkeypatch):
+    model = _tiny_model(False)
+    monkeypatch.setattr(
+        "speculators.models.dflash.core.select_anchors",
+        lambda *_args: (torch.tensor([0]), torch.tensor([True])),
+    )
+    generator = torch.Generator().manual_seed(1)
+    document_ids = torch.zeros(1, 32, dtype=torch.long)
+    document_ids[:, 1:] = 1
+    _, loss, metrics = model(
+        hidden_states=torch.randn(1, 32, 32, generator=generator),
+        input_ids=torch.randint(0, 64, (1, 32), generator=generator),
+        loss_mask=torch.ones(1, 32),
+        verifier_last_hidden_states=torch.randn(1, 32, 16, generator=generator),
+        document_ids=document_ids,
+        max_anchors=1,
+        loss_config=resolve_loss_config("real", "eager"),
+    )
+    assert loss.item() == 0.0
+    assert metrics["eal_j_b_total"].item() == 0
+
+
+def _tiny_reduced_vocab_model():
+    torch.manual_seed(0)
+    layer_config = Qwen3Config(
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        vocab_size=64,
+        _attn_implementation="eager",  # type: ignore[call-arg]
+    )
+    model = DFlashDraftModel(
+        DFlashSpeculatorConfig(
+            transformer_layer_config=layer_config,
+            draft_vocab_size=32,
+            block_size=4,
+            aux_hidden_state_layer_ids=[0, 1],
+            mask_token_id=0,
+            sample_from_anchor=False,
+        )
+    )
+    torch.nn.init.normal_(model.embed_tokens.weight)
+    torch.nn.init.normal_(model.lm_head.weight)
+    torch.nn.init.normal_(model.verifier_lm_head.weight)
+    torch.nn.init.ones_(model.verifier_norm.weight)
+    return model.eval()
+
+
+def test_reduced_vocab_ce_works_and_real_has_clear_error():
+    model = _tiny_reduced_vocab_model()
+    generator = torch.Generator().manual_seed(1)
+    batch = {
+        "hidden_states": torch.randn(1, 16, 32, generator=generator),
+        "input_ids": torch.full((1, 16), 63, dtype=torch.long),
+        "loss_mask": torch.ones(1, 16),
+        "verifier_last_hidden_states": torch.randn(1, 16, 16, generator=generator),
+        "document_ids": torch.zeros(1, 16, dtype=torch.long),
+    }
+    _, loss, _ = model(
+        **batch,
+        max_anchors=4,
+        loss_config=resolve_loss_config("ce", "eager"),
+    )
+    assert torch.isfinite(loss)
+    with pytest.raises(ValueError, match="equal target and draft vocabularies"):
+        model(
+            **batch,
+            max_anchors=4,
+            loss_config=resolve_loss_config("real", "eager"),
+        )
+
+
+def test_documented_real_config_passes_validation():
+    config = TrainConfig(
+        speculator_type="dflash",
+        loss=LossArgs(loss_fn='{"ce": 0.1, "real": 0.9}'),
+        dflash=DFlashArgs(per_position_loss_weight="fixed-exp-decay", block_size=8),
+    )
+    assert config.loss.loss_fn == '{"ce": 0.1, "real": 0.9}'
+    assert config.dflash.per_position_loss_weight == "fixed-exp-decay"
+    assert config.dflash.block_size == 8

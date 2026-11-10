@@ -565,6 +565,10 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             sample_from_anchor=self.config.sample_from_anchor,
             token_ids=token_ids,
             block_group_ids=block_group_ids,
+            block_document_ids=document_ids.squeeze(0)[
+                anchored_block_indices
+            ].unsqueeze(0),
+            use_draft_vocab=self.use_draft_vocab,
             realv_lambda=kwargs.get(
                 "realv_lambda",
                 kwargs.get("ealv_lambda", self.config.realv_lambda),

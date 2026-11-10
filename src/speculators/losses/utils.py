@@ -200,9 +200,14 @@ def _block_structured_loss(logits: torch.Tensor, targets: torch.Tensor):
     )
 
 
+def _block_structured_loss_eager(logits: torch.Tensor, targets: torch.Tensor):
+    """Identify eager block losses when dispatching inside compute_metrics."""
+    return _block_structured_loss(logits, targets)
+
+
 for _name in BLOCK_LOSS_NAMES:
     _FUSED_LOSS_FN_MAP[_name] = _block_structured_loss
-    _EAGER_LOSS_FN_MAP[_name] = _block_structured_loss
+    _EAGER_LOSS_FN_MAP[_name] = _block_structured_loss_eager
 
 
 _LOSS_FN_MAPS = {"fused": _FUSED_LOSS_FN_MAP, "eager": _EAGER_LOSS_FN_MAP}

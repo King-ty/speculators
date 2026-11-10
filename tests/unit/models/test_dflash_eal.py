@@ -1,7 +1,7 @@
 """Unit tests for block-structured EAL losses in DFlash metrics.
 
 The value/gradient references come from the two-step counterexample in
-the public examples/real derivation notes (section 8):
+the REAL paper:
 vocab {A, B}, gamma = 2, p1 = (0.4, 0.6), q1 = (0.8, 0.2), and a shared
 second-step draft q2 = (theta, 1 - theta) against p2(hA) = (0.9, 0.1),
 p2(hB) = (0.1, 0.9). There, J2 = 0.86 + 0.20*theta exactly, while the WTV
@@ -9,17 +9,19 @@ proxy gives 1.02 - 0.12*theta -- at theta = 0.5 the values coincide (0.96)
 but the gradients have opposite signs.
 """
 
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import torch
 from torch.nn import functional
 
 from speculators.losses import resolve_loss_config as _resolve_loss_config
+from speculators.models.dflash import metrics as dflash_metrics
 from speculators.models.dflash.metrics import (
     _block_eal_loss,
     compute_eal_terms,
     compute_metrics,
+    tv_loss_fused_or_eager,
 )
 
 
@@ -66,7 +68,7 @@ def _counterexample_batch(theta_raw: torch.Tensor):
 
 
 def _ref_compute_terms(draft_logits, teacher_logits, cont_ids, valid):
-    """Reference from public examples/real/pilot/eal_lab.py:compute_terms."""
+    """Compute path weights and overlap for a block trajectory."""
     log_q = functional.log_softmax(draft_logits.float(), dim=-1)
     log_p = functional.log_softmax(teacher_logits.float(), dim=-1).detach()
     ids = cont_ids.unsqueeze(-1)
@@ -165,13 +167,15 @@ class TestToyReferenceEquivalence:
         terms = compute_eal_terms(logits, targets, token_ids, loss_mask, block_size)
 
         n = logits.shape[1] // block_size
-        ref_valid = loss_mask.view(n, block_size).bool()
+        ref_valid = loss_mask.view(n, block_size).bool().cumprod(dim=-1).bool()
         _, ref_a, ref_prefix, ref_prev = _ref_compute_terms(
             logits.view(n, block_size, -1),
             targets.view(n, block_size, -1),
             token_ids.view(n, block_size),
             ref_valid,
         )
+        ref_prefix = torch.where(ref_valid, ref_prefix, torch.zeros_like(ref_prefix))
+        ref_prev = torch.where(ref_valid, ref_prev, torch.zeros_like(ref_prev))
         assert torch.allclose(terms["a"], ref_a, atol=1e-5)
         assert torch.allclose(terms["log_prefix"], ref_prefix, atol=1e-5)
         assert torch.allclose(terms["log_prev"], ref_prev, atol=1e-5)
@@ -279,6 +283,169 @@ class TestMaskingAndGradFlow:
                 block_size=2,
                 loss_config=resolve_loss_config("real"),
             )
+
+
+class TestTrajectoryLayout:
+    def _random_batch(self):
+        generator = torch.Generator().manual_seed(0)
+        logits = torch.randn(1, 4, 5, generator=generator, requires_grad=True)
+        targets = torch.randn(1, 4, 5, generator=generator)
+        token_ids = torch.tensor([[0, 1, 2, 3]])
+        loss_mask = torch.tensor([[0.0, 1.0, 1.0, 1.0]])
+        return logits, targets, token_ids, loss_mask
+
+    @pytest.mark.parametrize("name", ["real", "realp", "wtv"])
+    def test_perfect_prediction_without_anchor_has_zero_loss(self, name):
+        _, targets, token_ids, loss_mask = self._random_batch()
+        targets = torch.zeros_like(targets)
+        targets.scatter_(-1, token_ids.unsqueeze(-1), 100.0)
+        loss, _ = compute_metrics(
+            targets.clone(),
+            targets,
+            loss_mask,
+            block_size=4,
+            sample_from_anchor=False,
+            token_ids=token_ids,
+            loss_config=resolve_loss_config(name),
+        )
+        assert loss.item() == pytest.approx(0.0, abs=1e-4)
+
+    @pytest.mark.parametrize("name", ["wtv", "realk"])
+    def test_bonus_anchor_does_not_zero_gradient(self, name):
+        logits, targets, token_ids, loss_mask = self._random_batch()
+        loss, _ = compute_metrics(
+            logits,
+            targets,
+            loss_mask,
+            block_size=4,
+            sample_from_anchor=False,
+            token_ids=token_ids,
+            loss_config=resolve_loss_config(name),
+            realk_k=1,
+        )
+        (gradient,) = torch.autograd.grad(loss, logits)
+        assert gradient.abs().sum() > 0
+        assert gradient[0, 0].abs().sum() == 0
+
+    def test_realk_perfect_prediction_uses_prediction_window(self):
+        _, targets, token_ids, loss_mask = self._random_batch()
+        targets = torch.zeros_like(targets)
+        targets.scatter_(-1, token_ids.unsqueeze(-1), 100.0)
+        loss, _ = compute_metrics(
+            targets.clone(),
+            targets,
+            loss_mask,
+            block_size=4,
+            sample_from_anchor=False,
+            token_ids=token_ids,
+            loss_config=resolve_loss_config("realk"),
+            realk_k=1,
+        )
+        assert loss.item() == pytest.approx(1.0 - 1.0 / 3.0, abs=1e-4)
+
+    def test_bonus_anchor_terms_match_explicit_slice(self):
+        logits, targets, token_ids, loss_mask = self._random_batch()
+        actual = compute_eal_terms(
+            logits, targets, token_ids, loss_mask, 4, start_pos=1
+        )
+        expected = compute_eal_terms(
+            logits[:, 1:], targets[:, 1:], token_ids[:, 1:], loss_mask[:, 1:], 3
+        )
+        for key in ("a", "log_prefix", "log_r_prefix", "valid"):
+            assert torch.equal(actual[key], expected[key])
+
+    @pytest.mark.parametrize(
+        ("loss_mask", "document_ids", "expected_valid"),
+        [
+            (
+                [[1.0, 1.0, 0.0, 1.0]],
+                [[0, 0, 0, 0]],
+                [[True, True, False, False]],
+            ),
+            (
+                [[1.0, 1.0, 1.0, 1.0]],
+                [[0, 1, 1, 1]],
+                [[True, False, False, False]],
+            ),
+        ],
+    )
+    def test_mask_and_document_boundary_stop_trajectory(
+        self, loss_mask, document_ids, expected_valid
+    ):
+        logits, targets, token_ids, _ = self._random_batch()
+        terms = compute_eal_terms(
+            logits,
+            targets,
+            token_ids,
+            torch.tensor(loss_mask),
+            4,
+            document_ids=torch.tensor(document_ids),
+            loss_implementation="eager",
+        )
+        assert terms["valid"].tolist() == expected_valid
+        invalid = ~terms["valid"][0]
+        assert terms["log_r_prefix"][0, invalid].abs().sum() == 0
+        loss = _block_eal_loss(terms, "dblast", 4)
+        (gradient,) = torch.autograd.grad(loss, logits)
+        assert gradient[0, invalid].abs().sum() == 0
+
+    def test_dblast_bonus_anchor_has_no_gradient(self):
+        logits, targets, token_ids, loss_mask = self._random_batch()
+        loss, _ = compute_metrics(
+            logits,
+            targets,
+            loss_mask,
+            block_size=4,
+            sample_from_anchor=False,
+            token_ids=token_ids,
+            loss_config=resolve_loss_config("dblast"),
+        )
+        (gradient,) = torch.autograd.grad(loss, logits)
+        assert gradient[0, 0].abs().sum() == 0
+        assert gradient[0, 1:].abs().sum() > 0
+
+    def test_eager_never_dispatches_to_fused_on_cuda(self, monkeypatch):
+        class CudaTensor:
+            is_cuda = True
+
+        calls = []
+
+        def fused(*_args):
+            calls.append("fused")
+            return torch.tensor(1.0)
+
+        def eager(*_args):
+            calls.append("eager")
+            return torch.tensor(2.0)
+
+        monkeypatch.setattr(dflash_metrics, "tv_loss", fused)
+        monkeypatch.setattr(dflash_metrics.eager_losses, "tv_loss", eager)
+        tensor = cast("torch.Tensor", CudaTensor())
+        assert tv_loss_fused_or_eager(tensor, tensor, "eager").item() == 2.0
+        assert calls == ["eager"]
+        assert tv_loss_fused_or_eager(tensor, tensor, "fused").item() == 1.0
+        assert calls == ["eager", "fused"]
+
+    def test_eager_loss_config_reaches_trajectory_terms(self, monkeypatch):
+        observed = []
+        original = dflash_metrics.compute_eal_terms
+
+        def wrapped(*args, **kwargs):
+            observed.append(kwargs["loss_implementation"])
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(dflash_metrics, "compute_eal_terms", wrapped)
+        logits, targets, token_ids, loss_mask = self._random_batch()
+        compute_metrics(
+            logits,
+            targets,
+            loss_mask,
+            block_size=4,
+            sample_from_anchor=True,
+            token_ids=token_ids,
+            loss_config=resolve_loss_config("real"),
+        )
+        assert observed == ["eager"]
 
 
 # ---------------------------------------------------------------------------
@@ -864,8 +1031,7 @@ class TestREALK:
 
 
 class TestVSD:
-    """Hand-computed references from the public examples/real appendix-C
-    counterexample (§C.3-C.4):
+    """Hand-computed references for the VSD counterexample:
     gamma=2, target outputs (0.5, 0.5) at every prefix.
     M-step 加权 MLE 口径（loss = −(Σκ·log Q/Σκ)/B，κ 固定、detach、有界）：
       Draft1 loss = +1.201988, Draft2 loss = +0.791460（draft2 更优顺序保持）。

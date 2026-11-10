@@ -14,18 +14,27 @@ from speculators.losses import (
     tv_loss,
 )
 from speculators.losses import eager as eager_losses
-from speculators.losses.utils import BLOCK_LOSS_NAMES as _BLOCK_LOSS_NAMES
+from speculators.losses.utils import (
+    BLOCK_LOSS_NAMES as _BLOCK_LOSS_NAMES,
+)
+from speculators.losses.utils import (
+    _block_structured_loss_eager,
+)
 from speculators.models.metrics import (
     compute_accepted_length_counts,
     compute_accuracy_multi_step,
 )
 
 
-def tv_loss_fused_or_eager(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    """Use the fused overlap on CUDA and the eager reference elsewhere."""
-    if logits.is_cuda:
+def tv_loss_fused_or_eager(
+    logits: torch.Tensor, targets: torch.Tensor, implementation: str = "fused"
+) -> torch.Tensor:
+    """Dispatch the overlap, falling back to eager for fused requests on CPU."""
+    if implementation == "eager" or not logits.is_cuda:
+        return eager_losses.tv_loss(logits, targets)
+    if implementation == "fused":
         return tv_loss(logits, targets)
-    return eager_losses.tv_loss(logits, targets)
+    raise ValueError(f"Unknown loss implementation: {implementation}")
 
 
 _DEFAULT_LOSS_CONFIG: LossConfig = {"kl_div": (eager_losses.kl_div_loss, 1.0)}
@@ -113,6 +122,26 @@ def _reject_duplicate_objectives(block_names: list[str]) -> None:
         )
 
 
+def _block_loss_implementation(
+    loss_config: LossConfig,
+    block_names: list[str],
+    needs_eal_terms: bool,
+    use_draft_vocab: bool,
+) -> str:
+    if needs_eal_terms and use_draft_vocab:
+        raise ValueError(
+            "Block-structured trajectory losses require equal target and draft "
+            "vocabularies; reduced draft vocabularies are not supported"
+        )
+    implementations = {
+        "eager" if loss_config[name][0] is _block_structured_loss_eager else "fused"
+        for name in block_names
+    }
+    if len(implementations) > 1:
+        raise ValueError("All block losses must use the same loss implementation")
+    return implementations.pop() if implementations else "fused"
+
+
 def _gather_logp(
     logits: torch.Tensor,  # shape: [1, T, V]
     token_ids: torch.Tensor,  # shape: [1, T]
@@ -149,31 +178,73 @@ def compute_eal_terms(
     token_ids: torch.Tensor,  # shape: [1, num_blocks*block_size]
     loss_mask: torch.Tensor,  # shape: [1, num_blocks*block_size]
     block_size: int,
+    start_pos: int = 0,
+    document_ids: torch.Tensor | None = None,
+    loss_implementation: str = "fused",
 ) -> dict[str, torch.Tensor]:
-    """Per-block EAL quantities on the target-sampled trajectory.
+    """Per-block EAL quantities on target-sampled prediction trajectories.
 
-    Masked slots (padding / past EOS) get b = 1 (no path decay) and a = 0
-    (no length contribution). All outputs are [num_blocks, block_size].
+    ``start_pos`` removes a non-prediction bonus anchor before computing the
+    window. Document boundaries and the first masked prediction terminate each
+    trajectory. Outputs have shape [num_blocks, block_size - start_pos].
     """
+    if block_size <= 0 or not 0 <= start_pos < block_size:
+        raise ValueError("start_pos must leave at least one prediction slot")
+    if logits.shape[1] % block_size != 0:
+        raise ValueError("The sequence length must be divisible by block_size")
+    if logits.shape[-1] != targets.shape[-1]:
+        raise ValueError(
+            "REAL trajectory losses require a shared target/draft vocabulary"
+        )
+    if token_ids.shape != loss_mask.shape:
+        raise ValueError("token_ids and loss_mask must have the same shape")
+    if document_ids is not None and document_ids.shape != token_ids.shape:
+        raise ValueError("document_ids must have one id per token")
+    if token_ids.numel() and (
+        token_ids.min().item() < 0
+        or token_ids.max().item() >= logits.shape[-1]
+        or token_ids.max().item() >= targets.shape[-1]
+    ):
+        raise ValueError("token_ids must index the shared target/draft vocabulary")
+
+    def prediction_slots(tensor: torch.Tensor) -> torch.Tensor:
+        blocks = tensor.reshape(-1, block_size, *tensor.shape[2:])
+        return blocks[:, start_pos:].reshape(1, -1, *tensor.shape[2:])
+
+    logits = prediction_slots(logits)
+    targets = prediction_slots(targets)
+    token_ids = prediction_slots(token_ids)
+    valid = prediction_slots(loss_mask).bool().view(-1, block_size - start_pos)
+    if document_ids is not None:
+        doc_blocks = document_ids.reshape(-1, block_size)
+        within_document = (doc_blocks == doc_blocks[:, :1]).to(loss_mask.dtype)
+        valid = valid & prediction_slots(within_document).bool().view_as(valid)
+    valid = valid.cumprod(dim=-1).bool()
+    block_size -= start_pos
+
     lq = _gather_logp(logits, token_ids)
     with torch.no_grad():
         lp = _gather_logp(targets, token_ids)
-    valid = loss_mask.bool().view(-1, block_size)
-    log_b = (lq - lp).clamp(max=0.0).view(-1, block_size)
-    log_b = torch.where(valid, log_b, torch.zeros_like(log_b))
-    a = (1.0 - tv_loss_fused_or_eager(logits, targets)).view(-1, block_size)
+    log_ratio = (lq - lp).view(-1, block_size)
+    log_ratio = torch.where(valid, log_ratio, torch.zeros_like(log_ratio))
+    log_b = log_ratio.clamp(max=0.0)
+    a = (1.0 - tv_loss_fused_or_eager(logits, targets, loss_implementation)).view(
+        -1, block_size
+    )
     a = torch.where(valid, a, torch.zeros_like(a))
-    log_prefix = log_b.cumsum(dim=-1)
+    log_prefix = torch.where(valid, log_b.cumsum(dim=-1), torch.zeros_like(log_b))
     log_prev = torch.cat(
         [torch.zeros_like(log_prefix[:, :1]), log_prefix[:, :-1]], dim=-1
     )
+    log_prev = torch.where(valid, log_prev, torch.zeros_like(log_prev))
     # DBLast AL-loss terms (arXiv:2608.05448):
     #   log_r_prefix[l] = log(q(x_1:l)/p(x_1:l)) — raw (unclamped) prefix
     #   importance-ratio log; A_j = min(1, p(y_j)/q(y_j)) per-token acceptance
     #   probability on the trajectory. Masked slots get A = 1 (no decay) and
     #   log_r = 0 (excluded downstream by the retained-set mask).
-    log_r_prefix = (lq - lp).view(-1, block_size).cumsum(dim=-1)
-    log_r_prefix = torch.where(valid, log_r_prefix, torch.zeros_like(log_r_prefix))
+    log_r_prefix = torch.where(
+        valid, log_ratio.cumsum(dim=-1), torch.zeros_like(log_ratio)
+    )
     a_tok = (lp - lq).clamp(max=0.0).exp().view(-1, block_size)
     a_tok = torch.where(valid, a_tok, torch.ones_like(a_tok))
     return {
@@ -507,17 +578,19 @@ def _add_eal_diagnostics(
     metrics["eal_j_b_total"] = block_valid.sum()
     metrics["eal_j_wtv_sum"] = (j_wtv * block_valid).sum()
     metrics["eal_j_wtv_total"] = block_valid.sum()
-    for pos in range(start_pos, block_size):
-        metrics[f"eal_a_pos_{pos}_sum"] = (a_blk[:, pos] * fvalid[:, pos]).sum()
-        metrics[f"eal_a_pos_{pos}_total"] = fvalid[:, pos].sum()
-        metrics[f"eal_b_pos_{pos}_sum"] = (b_blk[:, pos] * fvalid[:, pos]).sum()
-        metrics[f"eal_b_pos_{pos}_total"] = fvalid[:, pos].sum()
+    for pos in range(start_pos, start_pos + block_size):
+        index = pos - start_pos
+        metrics[f"eal_a_pos_{pos}_sum"] = (a_blk[:, index] * fvalid[:, index]).sum()
+        metrics[f"eal_a_pos_{pos}_total"] = fvalid[:, index].sum()
+        metrics[f"eal_b_pos_{pos}_sum"] = (b_blk[:, index] * fvalid[:, index]).sum()
+        metrics[f"eal_b_pos_{pos}_total"] = fvalid[:, index].sum()
     # E[b_k * a_{k+1}] per adjacent pair; combine with the per-position
     # means downstream for Cov(b_k, a_{k+1}), the WTV-proxy bias term.
-    for pos in range(start_pos, block_size - 1):
-        pair = fvalid[:, pos] * fvalid[:, pos + 1]
+    for pos in range(start_pos, start_pos + block_size - 1):
+        index = pos - start_pos
+        pair = fvalid[:, index] * fvalid[:, index + 1]
         metrics[f"eal_ba_next_pos_{pos}_sum"] = (
-            b_blk[:, pos] * a_blk[:, pos + 1] * pair
+            b_blk[:, index] * a_blk[:, index + 1] * pair
         ).sum()
         metrics[f"eal_ba_next_pos_{pos}_total"] = pair.sum()
 
@@ -576,7 +649,10 @@ def compute_metrics(
     sample_from_anchor: bool = False,
     token_ids: torch.Tensor | None = None,  # shape: [1, num_anchors*block_size]
     block_group_ids: torch.Tensor | None = None,  # shape: [num_anchors]
-    eal_diagnostics: bool = True,
+    block_document_ids: torch.Tensor
+    | None = None,  # shape: [1, num_anchors*block_size]
+    use_draft_vocab: bool = False,
+    eal_diagnostics: bool | None = None,
     realv_lambda: float | None = None,
     realk_k: int | None = None,
     real_guard_on: bool | None = None,
@@ -604,19 +680,23 @@ def compute_metrics(
         token_ids: Data token id drafted at each slot, required by the
             block-structured losses (``wtv``/``real``/``realp``) and by the
             EAL diagnostics
-        block_group_ids: Per-block document id, required by the losses with
-            document-grouped semantics (``realv`` grouped variance)
-        eal_diagnostics: Compute EAL diagnostic metrics (needs token_ids)
+        block_group_ids: Per-block document id used for REALV variance grouping.
+        block_document_ids: Document id at every block slot. Trajectories stop
+            when the document changes; ``None`` assumes one document per block.
+        use_draft_vocab: Whether the draft uses a reduced vocabulary. Block-
+            structured trajectory losses require a shared target/draft vocabulary.
+        eal_diagnostics: Compute path diagnostics. None enables them when block
+            losses are selected and disables them for standard-only losses.
         realv_lambda: Weight of the document-grouped variance penalty in REALV
-        realk_k: Number of positions rewarded by REALK. If None, derive k from
-            ``real_guard_mu0`` when supplied, otherwise from the current EAL-B mean.
-            The derived value is clamped to ``1..block_size``.
+        realk_k: Number of prediction positions rewarded by REALK. If None,
+            derive k from ``real_guard_mu0`` when supplied, otherwise from the
+            current EAL-B mean, clamped to the prediction window.
         real_guard_on: Enable the mean-preservation guard. Disabled by default.
         real_guard_mu0: Reference acceptance-length mean. Required when
             ``real_guard_on=True``; also used to derive ``realk_k`` when supplied.
         real_guard_delta: Absolute mean drop tolerated before the guard activates.
         real_guard_rho: Guard strength per unit of mean shortfall, normalized by
-            ``block_size``.
+            the prediction window.
 
         The corresponding eal-prefixed names are accepted as legacy aliases.
 
@@ -664,6 +744,13 @@ def compute_metrics(
         raise ValueError(
             f"losses {block_names} are block-structured and require token_ids"
         )
+    start_pos = 0 if sample_from_anchor else 1
+    prediction_length = block_size - start_pos
+    path_diagnostics = bool(block_names) if eal_diagnostics is None else eal_diagnostics
+    needs_eal_terms = token_ids is not None and (bool(block_names) or path_diagnostics)
+    block_loss_implementation = _block_loss_implementation(
+        loss_config, block_names, needs_eal_terms, use_draft_vocab
+    )
 
     std_config = {
         name: fn_weight
@@ -685,15 +772,24 @@ def compute_metrics(
     )
 
     eal_terms = None
-    if token_ids is not None and (block_names or eal_diagnostics):
-        eal_terms = compute_eal_terms(logits, targets, token_ids, loss_mask, block_size)
+    if needs_eal_terms:
+        eal_terms = compute_eal_terms(
+            logits,
+            targets,
+            cast("torch.Tensor", token_ids),
+            loss_mask,
+            block_size,
+            start_pos=start_pos,
+            document_ids=block_document_ids,
+            loss_implementation=block_loss_implementation,
+        )
     eal_terms_for_loss = cast("dict[str, torch.Tensor]", eal_terms)
     for name in block_names:
         _, weight = loss_config[name]
         term = _block_eal_loss(
             eal_terms_for_loss,
             name,
-            block_size,
+            prediction_length,
             block_group_ids,
             realv_lambda=realv_lambda,
             realk_k=realk_k,
@@ -709,7 +805,7 @@ def compute_metrics(
         term_losses,
         eal_terms_for_loss,
         block_names,
-        block_size,
+        prediction_length,
         block_group_ids,
         realk_k,
         real_guard_on,
@@ -752,8 +848,6 @@ def compute_metrics(
         metrics[f"{term_name}_sum"] = term_val
         metrics[f"{term_name}_total"] = ones.clone()
 
-    # Start position: 0 if sample_from_anchor else 1 (skip anchor)
-    start_pos = 0 if sample_from_anchor else 1
     metrics["full_acc_sum"] = correct_per_pos[start_pos:].sum()
     metrics["full_acc_total"] = total_per_pos[start_pos:].sum()
 
@@ -768,7 +862,7 @@ def compute_metrics(
     metrics["eal_sum"] = eal_sum
     metrics["eal_total"] = eal_total
 
-    if eal_terms is not None and eal_diagnostics:
-        _add_eal_diagnostics(metrics, eal_terms, block_size, start_pos)
+    if eal_terms is not None and path_diagnostics:
+        _add_eal_diagnostics(metrics, eal_terms, prediction_length, start_pos)
 
     return loss, metrics
