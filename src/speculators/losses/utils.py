@@ -178,6 +178,33 @@ _EAGER_LOSS_FN_MAP: dict[str, Callable[[torch.Tensor, torch.Tensor], torch.Tenso
 }
 
 
+BLOCK_LOSS_NAMES = (
+    "realp",
+    "real",
+    "realk",
+    "realv",
+    "eala",
+    "ealb",
+    "ealk",
+    "ealv",
+    "wtv",
+    "dblast",
+    "vsd",
+)
+
+
+def _block_structured_loss(logits: torch.Tensor, targets: torch.Tensor):
+    """Mark losses that require DFlash block layout and per-slot token ids."""
+    raise NotImplementedError(
+        "Block-structured losses are only supported by DFlash-family compute_metrics"
+    )
+
+
+for _name in BLOCK_LOSS_NAMES:
+    _FUSED_LOSS_FN_MAP[_name] = _block_structured_loss
+    _EAGER_LOSS_FN_MAP[_name] = _block_structured_loss
+
+
 _LOSS_FN_MAPS = {"fused": _FUSED_LOSS_FN_MAP, "eager": _EAGER_LOSS_FN_MAP}
 
 

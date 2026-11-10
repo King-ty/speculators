@@ -136,6 +136,12 @@ import speculators
 print(speculators.__version__)
 ```
 
+## REAL loss objectives
+
+This branch contains the independently implemented REAL acceptance-length objectives and DFlash integration, with synthetic tests. It does not include the Domino model, curriculum training, or vLLM serving adaptations.
+
+Included objectives are REAL w/o RB (`realp`), REAL (`real`), WTV (`wtv`), DBLast (`dblast`), VSD (`vsd`), and the stability variants `realv` and `realk`. The stability variants expose `realv_lambda`, `realk_k`, `real_guard_on`, `real_guard_mu0`, `real_guard_delta`, and `real_guard_rho` through `DFlashSpeculatorConfig` and `DFlashArgs`. K is derived from `real_guard_mu0` when provided, otherwise from the current EAL-B mean, and is clamped to `1..block_size`. The guard is disabled by default and requires an explicit reference mean when enabled.
+
 ## License
 
 Speculators is licensed under the [Apache License 2.0](https://github.com/vllm-project/speculators/blob/main/LICENSE).

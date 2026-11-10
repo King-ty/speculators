@@ -1,6 +1,7 @@
 """Training loss implementations and shared utilities."""
 
 from speculators.losses.utils import (
+    BLOCK_LOSS_NAMES,
     LossConfig,
     ce_loss,
     compound_loss,
@@ -18,6 +19,7 @@ from speculators.losses.utils import (
 )
 
 __all__ = [
+    "BLOCK_LOSS_NAMES",
     "LossConfig",
     "ce_loss",
     "compound_loss",

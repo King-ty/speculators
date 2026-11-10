@@ -266,6 +266,18 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             "mask_token_id": kwargs.get("mask_token_id"),
             "sliding_window_non_causal": sliding_window_non_causal,
             "sample_from_anchor": sample_from_anchor,
+            "realv_lambda": kwargs.get("realv_lambda", kwargs.get("ealv_lambda", 0.05)),
+            "realk_k": kwargs.get("realk_k", kwargs.get("ealk_k")),
+            "real_guard_on": kwargs.get(
+                "real_guard_on", kwargs.get("eal_guard_on", False)
+            ),
+            "real_guard_mu0": kwargs.get("real_guard_mu0", kwargs.get("eal_guard_mu0")),
+            "real_guard_delta": kwargs.get(
+                "real_guard_delta", kwargs.get("eal_guard_delta", 0.05)
+            ),
+            "real_guard_rho": kwargs.get(
+                "real_guard_rho", kwargs.get("eal_guard_rho", 0.9)
+            ),
             "speculators_config": SpeculatorsConfig(
                 algorithm=algorithm,
                 proposal_methods=[
@@ -303,6 +315,18 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             "max_anchors": max_anchors,
             "per_position_loss_weight": per_position_loss_weight,
             "dpace_alpha": dpace_alpha,
+            "realv_lambda": kwargs.get("realv_lambda", kwargs.get("ealv_lambda", 0.05)),
+            "realk_k": kwargs.get("realk_k", kwargs.get("ealk_k")),
+            "real_guard_on": kwargs.get(
+                "real_guard_on", kwargs.get("eal_guard_on", False)
+            ),
+            "real_guard_mu0": kwargs.get("real_guard_mu0", kwargs.get("eal_guard_mu0")),
+            "real_guard_delta": kwargs.get(
+                "real_guard_delta", kwargs.get("eal_guard_delta", 0.05)
+            ),
+            "real_guard_rho": kwargs.get(
+                "real_guard_rho", kwargs.get("eal_guard_rho", 0.9)
+            ),
         }
         return dict(shared), dict(shared)
 
@@ -489,6 +513,14 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
 
         return hidden, logits, targets, aligned_loss_mask, anchored_block_indices
 
+    def _block_target_ids(
+        self, input_ids: torch.Tensor, anchored_block_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Return the data token id drafted at each block slot."""
+        if self.config.sample_from_anchor:
+            return input_ids[:, anchored_block_indices + 1]
+        return input_ids[:, anchored_block_indices]
+
     @conditional_torch_compile
     def forward(
         self,
@@ -505,16 +537,22 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         dpace_alpha: float = 0.5,
         **kwargs,
     ):
-        _, logits, targets, aligned_loss_mask, _ = self._backbone_forward(
-            hidden_states,
-            input_ids,
-            loss_mask,
-            verifier_last_hidden_states,
-            document_ids,
-            position_ids,
-            max_anchors=max_anchors,
-            **kwargs,
+        _, logits, targets, aligned_loss_mask, anchored_block_indices = (
+            self._backbone_forward(
+                hidden_states,
+                input_ids,
+                loss_mask,
+                verifier_last_hidden_states,
+                document_ids,
+                position_ids,
+                max_anchors=max_anchors,
+                **kwargs,
+            )
         )
+        token_ids = self._block_target_ids(input_ids, anchored_block_indices)
+        block_group_ids = document_ids.squeeze(0)[
+            anchored_block_indices.view(max_anchors, self.block_size)[:, 0]
+        ]
         loss, metrics = compute_metrics(
             logits,
             targets,
@@ -525,5 +563,28 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             per_position_loss_weight=per_position_loss_weight,
             dpace_alpha=dpace_alpha,
             sample_from_anchor=self.config.sample_from_anchor,
+            token_ids=token_ids,
+            block_group_ids=block_group_ids,
+            realv_lambda=kwargs.get(
+                "realv_lambda",
+                kwargs.get("ealv_lambda", self.config.realv_lambda),
+            ),
+            realk_k=kwargs.get("realk_k", kwargs.get("ealk_k", self.config.realk_k)),
+            real_guard_on=kwargs.get(
+                "real_guard_on",
+                kwargs.get("eal_guard_on", self.config.real_guard_on),
+            ),
+            real_guard_mu0=kwargs.get(
+                "real_guard_mu0",
+                kwargs.get("eal_guard_mu0", self.config.real_guard_mu0),
+            ),
+            real_guard_delta=kwargs.get(
+                "real_guard_delta",
+                kwargs.get("eal_guard_delta", self.config.real_guard_delta),
+            ),
+            real_guard_rho=kwargs.get(
+                "real_guard_rho",
+                kwargs.get("eal_guard_rho", self.config.real_guard_rho),
+            ),
         )
         return None, loss, metrics
